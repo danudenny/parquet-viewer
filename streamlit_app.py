@@ -1,151 +1,184 @@
 import streamlit as st
 import pandas as pd
-import math
-from pathlib import Path
+import geopandas as gpd
+import folium
+from folium.plugins import MarkerCluster
+from streamlit_folium import folium_static
+import pyarrow.parquet as pq
+import tempfile
+import os
 
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
-)
+st.set_page_config(page_title="Geometry Viewer", layout="wide")
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
+st.title("Geometry Viewer from Parquet Data")
+st.write("Upload a parquet file containing geometry data to visualize on a map.")
 
-@st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
+# File uploader
+uploaded_file = st.file_uploader("Choose a parquet file", type=["parquet"])
 
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
-    """
-
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
-
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
-
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
-    )
-
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
-
-    return gdp_df
-
-gdp_df = get_gdp_data()
-
-# -----------------------------------------------------------------------------
-# Draw the actual page
-
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
-
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
-
-# Add some spacing
-''
-''
-
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
-
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
-
-countries = gdp_df['Country Code'].unique()
-
-if not len(countries):
-    st.warning("Select at least one country")
-
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
-
-''
-''
-''
-
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
-
-st.header('GDP over time', divider='gray')
-
-''
-
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
-)
-
-''
-''
-
-
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
-
-st.header(f'GDP in {to_year}', divider='gray')
-
-''
-
-cols = st.columns(4)
-
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
-
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
+if uploaded_file is not None:
+    # Save the uploaded file to a temporary file
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.parquet') as tmp_file:
+        tmp_file.write(uploaded_file.getvalue())
+        tmp_path = tmp_file.name
+    
+    try:
+        # Read the parquet file
+        parquet_table = pq.read_table(tmp_path)
+        df = parquet_table.to_pandas()
+        
+        # Check if the file contains geometry data
+        geometry_cols = [col for col in df.columns if 'geom' in col.lower() or 'geometry' in col.lower()]
+        
+        if not geometry_cols:
+            st.error("No geometry column found in the uploaded file. Please make sure your file contains a column with geometry data.")
         else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
+            # Allow user to select which geometry column to use
+            if len(geometry_cols) > 1:
+                geometry_col = st.selectbox("Select geometry column", geometry_cols)
+            else:
+                geometry_col = geometry_cols[0]
+            
+            try:
+                # Try to convert to GeoDataFrame
+                gdf = gpd.GeoDataFrame(df, geometry=geometry_col)
+                
+                # If geometry is in WKB or WKT format, convert it
+                if not isinstance(gdf.geometry.iloc[0], gpd.geoseries.GeoSeries):
+                    try:
+                        # Try to convert from WKT or WKB
+                        gdf = gpd.GeoDataFrame(df, geometry=gpd.GeoSeries.from_wkt(df[geometry_col]))
+                    except:
+                        try:
+                            gdf = gpd.GeoDataFrame(df, geometry=gpd.GeoSeries.from_wkb(df[geometry_col]))
+                        except:
+                            st.error("Could not convert the geometry column to a valid geometry. Please check your data.")
+                
+                # Get info about the data
+                st.subheader("Data Information")
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.write(f"Total rows: {len(gdf)}")
+                    st.write(f"CRS: {gdf.crs}")
+                with col2:
+                    geometry_types = gdf.geometry.type.unique()
+                    st.write(f"Geometry types: {', '.join(geometry_types)}")
+                
+                # Display a sample of the data
+                st.subheader("Data Sample")
+                st.dataframe(df.head())
+                
+                # Filter by geometry type
+                st.subheader("Filter by Geometry Type")
+                selected_types = st.multiselect("Select geometry types to display", 
+                                                options=list(geometry_types),
+                                                default=list(geometry_types))
+                
+                if selected_types:
+                    filtered_gdf = gdf[gdf.geometry.type.isin(selected_types)]
+                    
+                    # Create a map centered on the mean of the data
+                    try:
+                        # Convert to EPSG:4326 if needed
+                        if gdf.crs and gdf.crs != "EPSG:4326":
+                            filtered_gdf = filtered_gdf.to_crs("EPSG:4326")
+                        
+                        # Calculate center of the data
+                        bounds = filtered_gdf.total_bounds
+                        center_lat = (bounds[1] + bounds[3]) / 2
+                        center_lon = (bounds[0] + bounds[2]) / 2
+                        
+                        # Create map
+                        m = folium.Map(location=[center_lat, center_lon], zoom_start=10)
+                        
+                        # Add different styles for different geometry types
+                        for geom_type in selected_types:
+                            type_gdf = filtered_gdf[filtered_gdf.geometry.type == geom_type]
+                            
+                            if len(type_gdf) > 0:
+                                if geom_type == 'Point':
+                                    # Use marker cluster for points to improve performance
+                                    marker_cluster = MarkerCluster().add_to(m)
+                                    for idx, row in type_gdf.iterrows():
+                                        folium.Marker(
+                                            location=[row.geometry.y, row.geometry.x],
+                                            popup=f"ID: {idx}"
+                                        ).add_to(marker_cluster)
+                                
+                                elif geom_type in ['LineString', 'MultiLineString']:
+                                    # Add lines
+                                    folium.GeoJson(
+                                        type_gdf,
+                                        name=geom_type,
+                                        style_function=lambda x: {
+                                            'color': 'blue',
+                                            'weight': 3,
+                                            'opacity': 0.7
+                                        }
+                                    ).add_to(m)
+                                
+                                elif geom_type in ['Polygon', 'MultiPolygon']:
+                                    # Add polygons
+                                    folium.GeoJson(
+                                        type_gdf,
+                                        name=geom_type,
+                                        style_function=lambda x: {
+                                            'fillColor': 'green',
+                                            'color': 'black',
+                                            'weight': 1,
+                                            'fillOpacity': 0.5
+                                        }
+                                    ).add_to(m)
+                        
+                        # Add layer control
+                        folium.LayerControl().add_to(m)
+                        
+                        # Display the map
+                        st.subheader("Map Visualization")
+                        folium_static(m)
+                        
+                    except Exception as e:
+                        st.error(f"Error creating map: {e}")
+                else:
+                    st.warning("Please select at least one geometry type to display")
+                
+            except Exception as e:
+                st.error(f"Error processing the data: {e}")
+    
+    except Exception as e:
+        st.error(f"Error reading the parquet file: {e}")
+    
+    finally:
+        # Clean up the temporary file
+        os.unlink(tmp_path)
+else:
+    st.info("Please upload a parquet file containing geometry data.")
 
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
-        )
+# Add some information about supported formats
+st.markdown("""
+### Supported formats
+- The app expects geometry data in a common format (WKT, WKB, or GeoSeries)
+- Supported geometry types: Point, MultiPoint, LineString, MultiLineString, Polygon, MultiPolygon
+- The parquet file should contain at least one column with geometry data
+- For best results, use data with EPSG:4326 (WGS84) coordinate reference system
+""")
+
+# Add requirements info
+st.sidebar.title("Requirements")
+st.sidebar.markdown("""
+To run this app, you need the following Python packages:
+```
+streamlit
+pandas
+geopandas
+folium
+streamlit-folium
+pyarrow
+shapely
+```
+
+Install them with:
+```
+pip install streamlit pandas geopandas folium streamlit-folium pyarrow shapely
+```
+""")
